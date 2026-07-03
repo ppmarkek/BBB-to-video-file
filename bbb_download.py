@@ -205,17 +205,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Convert to MP4 only, skip merged side-by-side video",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process one URL and exit (no prompt for more links)",
+    )
     return parser
 
 
-def prompt_for_url() -> str:
-    print("BBB Recording Downloader")
-    print()
-    print("Вставьте ссылку на playback BigBlueButton и нажмите Enter.")
-    print("Пример:")
-    print("  https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=...")
-    print()
+def prompt_for_url(*, first: bool = False) -> str:
+    if first:
+        print("BBB Recording Downloader")
+        print()
+        print("Вставьте ссылку на playback BigBlueButton и нажмите Enter.")
+        print("Пример:")
+        print("  https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=...")
+        print()
+    else:
+        print()
+        print("Готово. Вставьте следующую ссылку или нажмите Enter для выхода.")
     return input("URL: ").strip()
+
+
+def should_stop_urls(url: str) -> bool:
+    return not url or url.lower() in {"q", "quit", "exit", "выход"}
 
 
 def wait_for_exit() -> None:
@@ -226,29 +239,22 @@ def wait_for_exit() -> None:
             pass
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
-    if args.url is None:
-        args.url = prompt_for_url()
-
+def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
     try:
-        info = parse_playback_url(args.url)
+        info = parse_playback_url(url)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        wait_for_exit()
         return 1
 
-    output_dir = args.output_dir or Path("downloads") / info.meeting_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = output_dir or Path("downloads") / info.meeting_id
+    target_dir.mkdir(parents=True, exist_ok=True)
     print(f"Meeting ID: {info.meeting_id}")
-    print(f"Output directory: {output_dir.resolve()}")
+    print(f"Output directory: {target_dir.resolve()}")
 
     try:
-        webcams_path, deskshare_path = download_recording(info, output_dir)
+        webcams_path, deskshare_path = download_recording(info, target_dir)
     except (FileNotFoundError, requests.RequestException) as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        wait_for_exit()
         return 1
 
     if not ffmpeg_available():
@@ -257,7 +263,6 @@ def main(argv: list[str] | None = None) -> int:
             "Install ffmpeg: winget install ffmpeg",
             file=sys.stderr,
         )
-        wait_for_exit()
         return 1
 
     try:
@@ -268,29 +273,55 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Deskshare MP4: {deskshare_path.resolve()}")
     except subprocess.CalledProcessError as exc:
         print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
-        wait_for_exit()
         return 1
 
-    if args.no_merge:
+    if no_merge:
         print("MP4 conversion complete (--no-merge).")
-        wait_for_exit()
         return 0
 
     try:
         if deskshare_path:
-            merged_path = output_dir / f"{info.meeting_id}_merged.mp4"
+            merged_path = target_dir / f"{info.meeting_id}_merged.mp4"
             merge_side_by_side(deskshare_path, webcams_path, merged_path)
             print(f"Merged video saved to {merged_path.resolve()}")
         else:
             print(f"Video saved to {webcams_path.resolve()}")
     except subprocess.CalledProcessError as exc:
         print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
-        wait_for_exit()
         return 1
 
-    print("Done.")
-    wait_for_exit()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    interactive = not args.once and (
+        getattr(sys, "frozen", False) or sys.stdin.isatty()
+    )
+
+    exit_code = 0
+    url = args.url
+    first_prompt = url is None
+
+    while True:
+        if url is None:
+            url = prompt_for_url(first=first_prompt)
+            first_prompt = False
+            if should_stop_urls(url):
+                break
+
+        exit_code = process_recording(url, args.output_dir, args.no_merge)
+        print("Done." if exit_code == 0 else "Finished with errors.")
+
+        if not interactive:
+            break
+
+        url = None
+
+    if interactive or getattr(sys, "frozen", False):
+        wait_for_exit()
+
+    return exit_code
 
 
 if __name__ == "__main__":
