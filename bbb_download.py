@@ -98,7 +98,82 @@ def resolve_ffmpeg() -> str | None:
     return None
 
 
-def convert_to_mp4(input_path: Path, ffmpeg: str) -> Path:
+@dataclass(frozen=True)
+class VideoEncoder:
+    encoder_id: str
+    label: str
+    args: tuple[str, ...]
+
+
+def cpu_encoder() -> VideoEncoder:
+    return VideoEncoder(
+        "cpu",
+        "CPU (libx264)",
+        ("-c:v", "libx264", "-preset", "medium", "-crf", "23"),
+    )
+
+
+def detect_video_encoder(ffmpeg: str) -> VideoEncoder:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    encoders = f"{result.stdout}\n{result.stderr}"
+    if "h264_nvenc" in encoders:
+        return VideoEncoder(
+            "nvenc",
+            "GPU NVIDIA NVENC",
+            ("-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"),
+        )
+    if "h264_amf" in encoders:
+        return VideoEncoder(
+            "amf",
+            "GPU AMD AMF",
+            (
+                "-c:v",
+                "h264_amf",
+                "-quality",
+                "balanced",
+                "-rc",
+                "cqp",
+                "-qp_i",
+                "23",
+                "-qp_p",
+                "23",
+            ),
+        )
+    if "h264_qsv" in encoders:
+        return VideoEncoder(
+            "qsv",
+            "GPU Intel QSV",
+            ("-c:v", "h264_qsv", "-global_quality", "23"),
+        )
+    return cpu_encoder()
+
+
+def select_video_encoder(ffmpeg: str, force_cpu: bool) -> VideoEncoder:
+    if force_cpu:
+        return cpu_encoder()
+    return detect_video_encoder(ffmpeg)
+
+
+AUDIO_ARGS = ("-c:a", "aac", "-b:a", "192k")
+
+
+def run_ffmpeg(command: list[str]) -> None:
+    subprocess.run(command, check=True)
+
+
+def convert_to_mp4(
+    input_path: Path,
+    ffmpeg: str,
+    encoder: VideoEncoder,
+    *,
+    allow_cpu_fallback: bool = True,
+) -> Path:
     output_path = input_path.with_suffix(".mp4")
     if input_path.suffix.lower() == ".mp4":
         return input_path
@@ -113,28 +188,32 @@ def convert_to_mp4(input_path: Path, ffmpeg: str) -> Path:
         "0:v:0",
         "-map",
         "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        *encoder.args,
+        *AUDIO_ARGS,
         str(output_path),
     ]
-    print(f"Converting {input_path.name} to MP4...")
-    subprocess.run(command, check=True)
+    print(f"Converting {input_path.name} to MP4 ({encoder.label})...")
+    try:
+        run_ffmpeg(command)
+    except subprocess.CalledProcessError:
+        if allow_cpu_fallback and encoder.encoder_id != "cpu":
+            print(f"{encoder.label} failed, falling back to CPU...")
+            return convert_to_mp4(
+                input_path,
+                ffmpeg,
+                cpu_encoder(),
+                allow_cpu_fallback=False,
+            )
+        raise
+
     input_path.unlink()
     return output_path
 
 
-def ensure_mp4(path: Path, ffmpeg: str) -> Path:
+def ensure_mp4(path: Path, ffmpeg: str, encoder: VideoEncoder) -> Path:
     if path.suffix.lower() == ".mp4":
         return path
-    return convert_to_mp4(path, ffmpeg)
+    return convert_to_mp4(path, ffmpeg, encoder)
 
 
 def merge_side_by_side(
@@ -142,6 +221,9 @@ def merge_side_by_side(
     webcams_path: Path,
     output_path: Path,
     ffmpeg: str,
+    encoder: VideoEncoder,
+    *,
+    allow_cpu_fallback: bool = True,
 ) -> None:
     filter_complex = (
         "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
@@ -164,20 +246,26 @@ def merge_side_by_side(
         "[v]",
         "-map",
         "1:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        *encoder.args,
+        *AUDIO_ARGS,
         str(output_path),
     ]
-    print("Merging videos with ffmpeg...")
-    subprocess.run(command, check=True)
+    print(f"Merging videos with ffmpeg ({encoder.label})...")
+    try:
+        run_ffmpeg(command)
+    except subprocess.CalledProcessError:
+        if allow_cpu_fallback and encoder.encoder_id != "cpu":
+            print(f"{encoder.label} failed, falling back to CPU...")
+            merge_side_by_side(
+                deskshare_path,
+                webcams_path,
+                output_path,
+                ffmpeg,
+                cpu_encoder(),
+                allow_cpu_fallback=False,
+            )
+            return
+        raise
 
 
 def download_recording(
@@ -238,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Process one URL and exit (no prompt for more links)",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU encoding (disable GPU acceleration)",
+    )
     return parser
 
 
@@ -267,7 +360,12 @@ def wait_for_exit() -> None:
             pass
 
 
-def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
+def process_recording(
+    url: str,
+    output_dir: Path | None,
+    no_merge: bool,
+    force_cpu: bool,
+) -> int:
     try:
         info = parse_playback_url(url)
     except ValueError as exc:
@@ -295,12 +393,14 @@ def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
         return 1
 
     print(f"Using ffmpeg: {ffmpeg}")
+    encoder = select_video_encoder(ffmpeg, force_cpu)
+    print(f"Video encoder: {encoder.label}")
 
     try:
-        webcams_path = ensure_mp4(webcams_path, ffmpeg)
+        webcams_path = ensure_mp4(webcams_path, ffmpeg, encoder)
         print(f"Webcams MP4: {webcams_path.resolve()}")
         if deskshare_path:
-            deskshare_path = ensure_mp4(deskshare_path, ffmpeg)
+            deskshare_path = ensure_mp4(deskshare_path, ffmpeg, encoder)
             print(f"Deskshare MP4: {deskshare_path.resolve()}")
     except subprocess.CalledProcessError as exc:
         print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
@@ -313,7 +413,13 @@ def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
     try:
         if deskshare_path:
             merged_path = target_dir / f"{info.meeting_id}_merged.mp4"
-            merge_side_by_side(deskshare_path, webcams_path, merged_path, ffmpeg)
+            merge_side_by_side(
+                deskshare_path,
+                webcams_path,
+                merged_path,
+                ffmpeg,
+                encoder,
+            )
             print(f"Merged video saved to {merged_path.resolve()}")
         else:
             print(f"Video saved to {webcams_path.resolve()}")
@@ -341,7 +447,12 @@ def main(argv: list[str] | None = None) -> int:
             if should_stop_urls(url):
                 break
 
-        exit_code = process_recording(url, args.output_dir, args.no_merge)
+        exit_code = process_recording(
+            url,
+            args.output_dir,
+            args.no_merge,
+            args.cpu,
+        )
         print("Done." if exit_code == 0 else "Finished with errors.")
 
         if not interactive:

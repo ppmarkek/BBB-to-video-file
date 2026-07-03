@@ -26,6 +26,12 @@
 
 Для сборки из исходников ffmpeg подтягивается автоматически через `imageio-ffmpeg`.
 
+По умолчанию используется **GPU-кодирование** (NVIDIA NVENC → AMD AMF → Intel QSV), если доступно. При ошибке — автоматический fallback на CPU. Принудительно CPU:
+
+```powershell
+bbb-download.exe --cpu
+```
+
 ## Установка (локальные библиотеки в `.venv`)
 
 ```powershell
