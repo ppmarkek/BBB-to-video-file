@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -161,10 +163,110 @@ def select_video_encoder(ffmpeg: str, force_cpu: bool) -> VideoEncoder:
 
 
 AUDIO_ARGS = ("-c:a", "aac", "-b:a", "192k")
+DURATION_RE = re.compile(
+    r"Duration:\s*(?P<h>\d+):(?P<m>\d+):(?P<s>\d+\.?\d*)",
+)
+PROGRESS_BAR = "{desc} {n:.0f}%|{bar}| [{elapsed}<{remaining}]"
 
 
-def run_ffmpeg(command: list[str]) -> None:
-    subprocess.run(command, check=True)
+def probe_duration(ffmpeg: str, media_path: Path) -> float | None:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(media_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    match = DURATION_RE.search(result.stderr)
+    if not match:
+        return None
+    hours = int(match.group("h"))
+    minutes = int(match.group("m"))
+    seconds = float(match.group("s"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def probe_duration_from_command(ffmpeg: str, command: list[str]) -> float | None:
+    durations: list[float] = []
+    for index, arg in enumerate(command):
+        if arg == "-i" and index + 1 < len(command):
+            duration = probe_duration(ffmpeg, Path(command[index + 1]))
+            if duration:
+                durations.append(duration)
+    if not durations:
+        return None
+    return max(durations)
+
+
+def add_progress_output(command: list[str]) -> list[str]:
+    head: list[str] = [command[0]]
+    tail_start = 1
+    while tail_start < len(command) and command[tail_start] in ("-y", "-nostdin"):
+        head.append(command[tail_start])
+        tail_start += 1
+    return [*head, "-progress", "pipe:1", "-nostats", *command[tail_start:]]
+
+
+def _drain_stream(stream) -> None:
+    if stream is None:
+        return
+    for _ in stream:
+        pass
+
+
+def run_ffmpeg_with_progress(
+    command: list[str],
+    label: str,
+    duration_seconds: float | None = None,
+) -> None:
+    ffmpeg = command[0]
+    if duration_seconds is None:
+        duration_seconds = probe_duration_from_command(ffmpeg, command)
+
+    progress_command = add_progress_output(command)
+    process = subprocess.Popen(
+        progress_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    stderr_thread = threading.Thread(
+        target=_drain_stream,
+        args=(process.stderr,),
+        daemon=True,
+    )
+    stderr_thread.start()
+
+    with tqdm(total=100, desc=label, bar_format=PROGRESS_BAR) as bar:
+        if duration_seconds is None:
+            bar.set_description(f"{label} (duration unknown)")
+
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us=") and duration_seconds:
+                value = line.split("=", 1)[1]
+                if value == "N/A":
+                    continue
+                current_sec = int(value) / 1_000_000
+                percent = min(99.0, (current_sec / duration_seconds) * 100)
+                bar.n = int(percent)
+                bar.refresh()
+            elif line == "progress=end":
+                bar.n = 100
+                bar.refresh()
+
+        return_code = process.wait()
+        stderr_thread.join(timeout=1)
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, progress_command)
+
+
+def run_ffmpeg(command: list[str], label: str) -> None:
+    run_ffmpeg_with_progress(command, label)
 
 
 def convert_to_mp4(
@@ -194,7 +296,7 @@ def convert_to_mp4(
     ]
     print(f"Converting {input_path.name} to MP4 ({encoder.label})...")
     try:
-        run_ffmpeg(command)
+        run_ffmpeg(command, f"Convert {input_path.stem}")
     except subprocess.CalledProcessError:
         if allow_cpu_fallback and encoder.encoder_id != "cpu":
             print(f"{encoder.label} failed, falling back to CPU...")
@@ -252,7 +354,7 @@ def merge_side_by_side(
     ]
     print(f"Merging videos with ffmpeg ({encoder.label})...")
     try:
-        run_ffmpeg(command)
+        run_ffmpeg(command, "Merge")
     except subprocess.CalledProcessError:
         if allow_cpu_fallback and encoder.encoder_id != "cpu":
             print(f"{encoder.label} failed, falling back to CPU...")
