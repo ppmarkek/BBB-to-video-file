@@ -76,6 +76,41 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def convert_to_mp4(input_path: Path) -> Path:
+    output_path = input_path.with_suffix(".mp4")
+    if input_path.suffix.lower() == ".mp4":
+        return input_path
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        str(output_path),
+    ]
+    print(f"Converting {input_path.name} to MP4...")
+    subprocess.run(command, check=True)
+    input_path.unlink()
+    return output_path
+
+
+def ensure_mp4(path: Path) -> Path:
+    if path.suffix.lower() == ".mp4":
+        return path
+    return convert_to_mp4(path)
+
+
 def merge_side_by_side(
     deskshare_path: Path,
     webcams_path: Path,
@@ -117,28 +152,6 @@ def merge_side_by_side(
     subprocess.run(command, check=True)
 
 
-def convert_webcams_only(webcams_path: Path, output_path: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(webcams_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        str(output_path),
-    ]
-    print("Converting webcams video to MP4...")
-    subprocess.run(command, check=True)
-
-
 def download_recording(
     info: RecordingInfo,
     output_dir: Path,
@@ -176,7 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download BigBlueButton recordings and merge them into MP4",
     )
-    parser.add_argument("url", help="BBB playback URL with meetingId parameter")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        help="BBB playback URL with meetingId parameter",
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -186,18 +203,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-merge",
         action="store_true",
-        help="Download raw video files only, skip ffmpeg merge",
+        help="Convert to MP4 only, skip merged side-by-side video",
     )
     return parser
+
+
+def prompt_for_url() -> str:
+    print("BBB Recording Downloader")
+    print()
+    print("Вставьте ссылку на playback BigBlueButton и нажмите Enter.")
+    print("Пример:")
+    print("  https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=...")
+    print()
+    return input("URL: ").strip()
+
+
+def wait_for_exit() -> None:
+    if getattr(sys, "frozen", False):
+        try:
+            input("\nНажмите Enter для выхода...")
+        except EOFError:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.url is None:
+        args.url = prompt_for_url()
+
     try:
         info = parse_playback_url(args.url)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        wait_for_exit()
         return 1
 
     output_dir = args.output_dir or Path("downloads") / info.meeting_id
@@ -209,19 +248,33 @@ def main(argv: list[str] | None = None) -> int:
         webcams_path, deskshare_path = download_recording(info, output_dir)
     except (FileNotFoundError, requests.RequestException) as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        wait_for_exit()
         return 1
-
-    if args.no_merge:
-        print("Download complete (--no-merge).")
-        return 0
 
     if not ffmpeg_available():
         print(
-            "ffmpeg not found in PATH. Raw files were downloaded.\n"
-            "Install ffmpeg and rerun without --no-merge, or merge manually.",
+            "ffmpeg not found in PATH. Files were downloaded in original format.\n"
+            "Install ffmpeg: winget install ffmpeg",
             file=sys.stderr,
         )
+        wait_for_exit()
         return 1
+
+    try:
+        webcams_path = ensure_mp4(webcams_path)
+        print(f"Webcams MP4: {webcams_path.resolve()}")
+        if deskshare_path:
+            deskshare_path = ensure_mp4(deskshare_path)
+            print(f"Deskshare MP4: {deskshare_path.resolve()}")
+    except subprocess.CalledProcessError as exc:
+        print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
+        wait_for_exit()
+        return 1
+
+    if args.no_merge:
+        print("MP4 conversion complete (--no-merge).")
+        wait_for_exit()
+        return 0
 
     try:
         if deskshare_path:
@@ -229,14 +282,14 @@ def main(argv: list[str] | None = None) -> int:
             merge_side_by_side(deskshare_path, webcams_path, merged_path)
             print(f"Merged video saved to {merged_path.resolve()}")
         else:
-            single_path = output_dir / f"{info.meeting_id}.mp4"
-            convert_webcams_only(webcams_path, single_path)
-            print(f"Video saved to {single_path.resolve()}")
+            print(f"Video saved to {webcams_path.resolve()}")
     except subprocess.CalledProcessError as exc:
         print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
+        wait_for_exit()
         return 1
 
     print("Done.")
+    wait_for_exit()
     return 0
 
 

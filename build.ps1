@@ -18,3 +18,5 @@ Write-Host "Building bbb-download.exe..." -ForegroundColor Cyan
 
 Write-Host ""
 Write-Host "Done: dist\bbb-download.exe" -ForegroundColor Green
+Copy-Item -Force "run.bat" "dist\run.bat"
+Write-Host "Also: dist\run.bat (double-click to paste URL)" -ForegroundColor Green
