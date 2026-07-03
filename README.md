@@ -22,15 +22,9 @@
 ## Требования
 
 - Python 3.10+
-- [ffmpeg](https://ffmpeg.org/) в PATH
+- [ffmpeg](https://ffmpeg.org/) в PATH (опционально — в exe уже встроен)
 
-Установка ffmpeg на Windows:
-
-```powershell
-winget install ffmpeg
-```
-
-Или скачайте сборку с [ffmpeg.org](https://ffmpeg.org/download.html) и добавьте в PATH.
+Для сборки из исходников ffmpeg подтягивается автоматически через `imageio-ffmpeg`.
 
 ## Установка (локальные библиотеки в `.venv`)
 

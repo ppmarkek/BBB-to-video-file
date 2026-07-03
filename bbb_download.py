@@ -72,21 +72,47 @@ def download_file(url: str, dest: Path) -> None:
                     progress.update(len(chunk))
 
 
-def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+def resolve_ffmpeg() -> str | None:
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        bundled = Path(get_ffmpeg_exe())
+        if bundled.is_file():
+            return str(bundled)
+    except ImportError:
+        pass
+
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent
+
+    for candidate in (base / "ffmpeg.exe", base / "ffmpeg" / "ffmpeg.exe"):
+        if candidate.is_file():
+            return str(candidate)
+
+    return None
 
 
-def convert_to_mp4(input_path: Path) -> Path:
+def convert_to_mp4(input_path: Path, ffmpeg: str) -> Path:
     output_path = input_path.with_suffix(".mp4")
     if input_path.suffix.lower() == ".mp4":
         return input_path
 
     command = [
-        "ffmpeg",
+        ffmpeg,
         "-y",
         "-nostdin",
         "-i",
         str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
         "-c:v",
         "libx264",
         "-preset",
@@ -105,16 +131,17 @@ def convert_to_mp4(input_path: Path) -> Path:
     return output_path
 
 
-def ensure_mp4(path: Path) -> Path:
+def ensure_mp4(path: Path, ffmpeg: str) -> Path:
     if path.suffix.lower() == ".mp4":
         return path
-    return convert_to_mp4(path)
+    return convert_to_mp4(path, ffmpeg)
 
 
 def merge_side_by_side(
     deskshare_path: Path,
     webcams_path: Path,
     output_path: Path,
+    ffmpeg: str,
 ) -> None:
     filter_complex = (
         "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
@@ -124,8 +151,9 @@ def merge_side_by_side(
         "[v0][v1]hstack=inputs=2[v]"
     )
     command = [
-        "ffmpeg",
+        ffmpeg,
         "-y",
+        "-nostdin",
         "-i",
         str(deskshare_path),
         "-i",
@@ -257,19 +285,22 @@ def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    if not ffmpeg_available():
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
         print(
-            "ffmpeg not found in PATH. Files were downloaded in original format.\n"
-            "Install ffmpeg: winget install ffmpeg",
+            "ffmpeg not found. Install it or rebuild the app with bundled ffmpeg.\n"
+            "Try: winget install ffmpeg",
             file=sys.stderr,
         )
         return 1
 
+    print(f"Using ffmpeg: {ffmpeg}")
+
     try:
-        webcams_path = ensure_mp4(webcams_path)
+        webcams_path = ensure_mp4(webcams_path, ffmpeg)
         print(f"Webcams MP4: {webcams_path.resolve()}")
         if deskshare_path:
-            deskshare_path = ensure_mp4(deskshare_path)
+            deskshare_path = ensure_mp4(deskshare_path, ffmpeg)
             print(f"Deskshare MP4: {deskshare_path.resolve()}")
     except subprocess.CalledProcessError as exc:
         print(f"ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
@@ -282,7 +313,7 @@ def process_recording(url: str, output_dir: Path | None, no_merge: bool) -> int:
     try:
         if deskshare_path:
             merged_path = target_dir / f"{info.meeting_id}_merged.mp4"
-            merge_side_by_side(deskshare_path, webcams_path, merged_path)
+            merge_side_by_side(deskshare_path, webcams_path, merged_path, ffmpeg)
             print(f"Merged video saved to {merged_path.resolve()}")
         else:
             print(f"Video saved to {webcams_path.resolve()}")

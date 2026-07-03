@@ -1,13 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
+
+imageio_ffmpeg_datas, imageio_ffmpeg_binaries, imageio_ffmpeg_hiddenimports = collect_all(
+    "imageio_ffmpeg"
+)
 
 a = Analysis(
     ['bbb_download.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=['requests', 'tqdm', 'certifi'],
+    binaries=imageio_ffmpeg_binaries,
+    datas=imageio_ffmpeg_datas,
+    hiddenimports=['requests', 'tqdm', 'certifi', 'imageio_ffmpeg', *imageio_ffmpeg_hiddenimports],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
