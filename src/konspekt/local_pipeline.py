@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +17,13 @@ from urllib.parse import urlparse
 import requests
 
 from .bbb_download import resolve_ffmpeg
-from .bbb_import import BBBRecording, default_library_path
+from .bbb_import import (
+    BBBImportError,
+    BBBRecording,
+    default_library_path,
+    load_library,
+    recording_identity,
+)
 
 
 class LocalProcessingError(RuntimeError):
@@ -59,20 +67,53 @@ class LocalTranscriber(Protocol):
 
 
 def default_lecture_directory(recording: BBBRecording) -> Path:
-    return default_library_path().parent / "lectures" / recording.meeting_id
+    base = default_library_path().parent / "lectures"
+    meeting_id = recording.meeting_id.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,200}", meeting_id):
+        directory_name = meeting_id
+        try:
+            same_id = [
+                item for item in load_library() if item.meeting_id == recording.meeting_id
+            ]
+        except BBBImportError:
+            same_id = []
+        identities = {recording_identity(item) for item in same_id}
+        if len(identities) > 1:
+            # Once an id collision exists, every BBB origin gets a deterministic
+            # directory. No mutable import timestamp can make two lectures swap
+            # ownership of an existing cache on a later re-import.
+            digest = hashlib.sha256(
+                repr(recording_identity(recording)).encode("utf-8")
+            ).hexdigest()[:12]
+            directory_name = f"{meeting_id[:80]}-{digest}"
+    else:
+        digest = hashlib.sha256(
+            repr(recording_identity(recording)).encode("utf-8")
+        ).hexdigest()[:24]
+        directory_name = f"lecture-{digest}"
+    target = base / directory_name
+    try:
+        target.resolve().relative_to(base.resolve())
+    except ValueError as exc:
+        raise LocalProcessingError("Небезопасный идентификатор лекции.") from exc
+    return target
 
 
 def lecture_is_prepared(recording: BBBRecording) -> bool:
-    return (default_lecture_directory(recording) / "transcript.md").is_file()
+    directory = default_lecture_directory(recording)
+    return (directory / "transcript.md").is_file() and (
+        directory / "transcript.json"
+    ).is_file()
 
 
 def prepare_lecture(
     recording: BBBRecording,
     *,
     directory: Path | None = None,
-    model_name: str = "small",
+    model_name: str = "base",
     language: str | None = None,
-    frame_interval_seconds: int = 30,
+    frame_interval_seconds: int = 60,
+    enable_ocr: bool = True,
     progress: ProgressCallback | None = None,
     downloader: MediaDownloader | None = None,
     transcriber: LocalTranscriber | None = None,
@@ -115,17 +156,45 @@ def prepare_lecture(
         _extract_audio(ffmpeg, webcam_path, audio_path, command_runner)
     notify(36, "Аудио подготовлено.")
 
-    notify(40, "Распознаём речь локальной моделью Whisper…")
-    recognise = transcriber or faster_whisper_transcribe(model_name)
-    segments = tuple(recognise(audio_path, language))
     transcript_path = target / "transcript.md"
-    notify(62, "Сохраняем транскрипцию…")
-    _write_transcript(target, segments)
-    notify(66, "Транскрипция готова.")
+    transcript_json_path = target / "transcript.json"
+    if transcript_path.is_file() and transcript_json_path.is_file():
+        notify(66, "Используем уже готовую локальную транскрипцию.")
+    else:
+        notify(40, "Распознаём речь локальной моделью Whisper…")
+        recognise = transcriber or faster_whisper_transcribe(
+            model_name,
+            progress=notify,
+        )
+        try:
+            segments = tuple(recognise(audio_path, language))
+        except LocalProcessingError:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            raise LocalProcessingError(
+                "Распознавание речи не завершилось вовремя. Повтори попытку — уже скачанные файлы сохранятся."
+            ) from exc
+        except Exception as exc:
+            raise LocalProcessingError(
+                "Whisper не смог обработать аудио. Проверь установку модели и свободное место на диске."
+            ) from exc
+        notify(62, "Сохраняем транскрипцию…")
+        _write_transcript(target, segments)
+        notify(66, "Транскрипция готова.")
 
     screen_notes_path: Path | None = None
     frame_count = 0
-    if recording.screen_video_url:
+    if recording.screen_video_url and not enable_ocr:
+        existing_screen_notes = target / "screen-notes.json"
+        if _screen_notes_cache_is_valid(existing_screen_notes):
+            screen_notes_path = existing_screen_notes
+            notify(96, "Используем уже готовые заметки с экрана.")
+        else:
+            notify(
+                96,
+                "Обработка демонстрации экрана отключена в настройках.",
+            )
+    elif recording.screen_video_url:
         notify(70, "Скачиваем демонстрацию экрана…")
         screen_path = target / f"deskshare{_extension_from_url(recording.screen_video_url)}"
         if not screen_path.is_file():
@@ -136,8 +205,13 @@ def prepare_lecture(
             )
 
         frames_dir = target / "frames"
+        frame_interval_path = frames_dir / "interval-seconds.txt"
+        effective_frame_interval = frame_interval_seconds
         if not any(frames_dir.glob("frame-*.jpg")):
-            notify(80, "Выбираем кадры экрана каждые 30 секунд…")
+            notify(
+                80,
+                f"Выбираем кадры экрана каждые {frame_interval_seconds} секунд…",
+            )
             _extract_frames(
                 ffmpeg,
                 screen_path,
@@ -145,21 +219,47 @@ def prepare_lecture(
                 frame_interval_seconds,
                 command_runner,
             )
+            frame_interval_path.write_text(
+                str(frame_interval_seconds),
+                encoding="ascii",
+            )
         frames = sorted(frames_dir.glob("frame-*.jpg"))
         frame_count = len(frames)
+        if frame_interval_path.is_file():
+            try:
+                saved_interval = int(frame_interval_path.read_text(encoding="ascii").strip())
+                if saved_interval > 0:
+                    effective_frame_interval = saved_interval
+            except (OSError, UnicodeError, ValueError):
+                pass
+        elif frames:
+            # Builds before interval metadata used the historical 30-second default.
+            effective_frame_interval = 30
 
-        if ocr_reader is None:
-            ocr_reader = default_ocr_reader()
-        if ocr_reader is not None:
+        existing_screen_notes = target / "screen-notes.json"
+        if _screen_notes_cache_is_valid(existing_screen_notes):
+            screen_notes_path = existing_screen_notes
+            notify(96, "Используем уже готовые заметки с экрана.")
+        else:
+            if ocr_reader is None:
+                ocr_reader = default_ocr_reader()
+        if enable_ocr and screen_notes_path is None and ocr_reader is not None:
             notify(88, "Распознаём текст на экране локально…")
-            notes = _read_frames(frames, frame_interval_seconds, ocr_reader)
+            notes = _read_frames(
+                frames,
+                effective_frame_interval,
+                ocr_reader,
+                progress=notify,
+            )
             screen_notes_path = target / "screen-notes.json"
             notify(96, "Сохраняем заметки с экрана…")
-            screen_notes_path.write_text(
+            temporary_notes_path = screen_notes_path.with_suffix(".json.tmp")
+            temporary_notes_path.write_text(
                 json.dumps([asdict(note) for note in notes], ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        else:
+            temporary_notes_path.replace(screen_notes_path)
+        elif enable_ocr and screen_notes_path is None:
             notify(96, "Кадры сохранены. OCR пропущен: Tesseract пока не установлен.")
 
     notify(100, "Материалы готовы для следующего шага.")
@@ -180,49 +280,127 @@ def download_media(
     """Download one public BBB asset with bounded, local file handling."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.part")
+    response: requests.Response | None = None
     try:
-        response = requests.get(url, stream=True, timeout=60)
+        if progress:
+            progress(f"Подключаемся к источнику файла {destination.name}…")
+        response = requests.get(url, stream=True, timeout=(15, 60))
         response.raise_for_status()
-    except requests.RequestException as exc:
-        raise LocalProcessingError("Не удалось скачать один из файлов BBB-записи.") from exc
+        total_header = response.headers.get("Content-Length")
+        try:
+            total_bytes = int(total_header) if total_header else 0
+        except (TypeError, ValueError):
+            total_bytes = 0
 
-    with destination.open("wb") as output:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
+        downloaded = 0
+        next_report = 8 * 1024 * 1024
+        with temporary.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
                 output.write(chunk)
+                downloaded += len(chunk)
+                if progress and downloaded >= next_report:
+                    downloaded_mb = downloaded / (1024 * 1024)
+                    if total_bytes > 0:
+                        total_mb = total_bytes / (1024 * 1024)
+                        progress(
+                            f"Скачиваем {destination.name}: {downloaded_mb:.0f} из {total_mb:.0f} МБ…"
+                        )
+                    else:
+                        progress(f"Скачиваем {destination.name}: {downloaded_mb:.0f} МБ…")
+                    next_report = downloaded + 8 * 1024 * 1024
+
+        temporary.replace(destination)
+    except requests.RequestException as exc:
+        temporary.unlink(missing_ok=True)
+        raise LocalProcessingError(
+            "Не удалось скачать один из файлов BBB-записи. Проверь подключение и повтори попытку."
+        ) from exc
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise LocalProcessingError(
+            "Не удалось сохранить загруженный файл. Проверь свободное место и доступ к папке приложения."
+        ) from exc
+    finally:
+        if response is not None:
+            response.close()
 
     if progress:
         progress(f"Файл сохранён: {destination.name}")
 
 
-def faster_whisper_transcribe(model_name: str) -> LocalTranscriber:
+def faster_whisper_transcribe(
+    model_name: str,
+    model_factory: Callable[..., object] | None = None,
+    progress: ProgressCallback | None = None,
+) -> LocalTranscriber:
     """Build a CPU-friendly Faster-Whisper transcriber only when it is needed."""
 
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise LocalProcessingError(
-            "Локальный Whisper не установлен. Запусти .\\setup_local_ai.ps1, затем повтори подготовку."
-        ) from exc
+    if model_factory is None:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise LocalProcessingError(
+                "Локальный Whisper не установлен. Запусти .\\setup_local_ai.ps1, затем повтори подготовку."
+            ) from exc
+        model_factory = WhisperModel
 
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    notify = progress or _do_nothing
+    notify(41, f"Загружаем локальную модель Whisper {model_name}…")
+    try:
+        model = model_factory(model_name, device="cpu", compute_type="int8")
+    except LocalProcessingError:
+        raise
+    except Exception as exc:
+        raise LocalProcessingError(
+            "Не удалось загрузить локальную модель Whisper. Проверь интернет для первой загрузки модели и свободное место на диске."
+        ) from exc
+    notify(43, "Модель Whisper готова. Начинаем распознавание речи…")
 
     def transcribe(audio_path: Path, language: str | None) -> Iterable[TranscriptSegment]:
         try:
-            segments, _ = model.transcribe(
+            raw_segments, info = model.transcribe(
                 str(audio_path),
                 language=language,
                 vad_filter=True,
             )
-            return tuple(
-                TranscriptSegment(
-                    start_seconds=float(segment.start),
-                    end_seconds=float(segment.end),
-                    text=segment.text.strip(),
-                )
-                for segment in segments
-                if segment.text.strip()
-            )
+            duration = float(getattr(info, "duration", 0) or 0)
+            converted: list[TranscriptSegment] = []
+            last_percent = 43
+            for segment_index, segment in enumerate(raw_segments, start=1):
+                end_seconds = float(segment.end)
+                if duration > 0:
+                    ratio = min(max(end_seconds / duration, 0), 1)
+                    current_percent = 44 + int(ratio * 17)
+                else:
+                    current_percent = 44
+                if current_percent > last_percent or segment_index % 25 == 0:
+                    reported_percent = max(last_percent, current_percent)
+                    notify(
+                        reported_percent,
+                        f"Распознаём речь: обработано до {_format_timestamp(end_seconds)}…",
+                    )
+                    last_percent = reported_percent
+
+                text = segment.text.strip()
+                if text:
+                    converted.append(
+                        TranscriptSegment(
+                            start_seconds=float(segment.start),
+                            end_seconds=end_seconds,
+                            text=text,
+                        )
+                    )
+            notify(61, f"Речь распознана: фрагментов {len(converted)}.")
+            return tuple(converted)
+        except LocalProcessingError:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            raise LocalProcessingError(
+                "Распознавание речи не завершилось вовремя. Повтори попытку позже."
+            ) from exc
         except Exception as exc:
             raise LocalProcessingError(
                 "Whisper не смог обработать аудио. Проверь установку модели и свободное место на диске."
@@ -238,22 +416,42 @@ def default_ocr_reader() -> Callable[[Path], str | None] | None:
 
     def read(image_path: Path) -> str | None:
         preferred = [executable, str(image_path), "stdout", "-l", "eng+rus"]
-        result = subprocess.run(
-            preferred,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=_tesseract_environment(executable),
-        )
-        if result.returncode != 0:
+        try:
             result = subprocess.run(
-                [executable, str(image_path), "stdout"],
+                preferred,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 env=_tesseract_environment(executable),
+                timeout=45,
             )
-        return result.stdout.strip() or None
+            if result.returncode != 0:
+                result = subprocess.run(
+                    [executable, str(image_path), "stdout"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    env=_tesseract_environment(executable),
+                    timeout=45,
+                )
+            if result.returncode != 0:
+                raise LocalProcessingError(
+                    f"Tesseract не смог распознать кадр {image_path.name}. "
+                    "Кадр останется доступен для повторной попытки."
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise LocalProcessingError(
+                f"Tesseract слишком долго обрабатывал кадр {image_path.name}."
+            ) from exc
+        except OSError as exc:
+            raise LocalProcessingError(
+                "Не удалось запустить локальный Tesseract для OCR экрана."
+            ) from exc
+        return (result.stdout or "").strip() or None
 
     return read
 
@@ -291,24 +489,33 @@ def _extract_audio(
     destination: Path,
     command_runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    _run_ffmpeg(
-        [
-            ffmpeg,
-            "-y",
-            "-nostdin",
-            "-i",
-            str(source),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(destination),
-        ],
-        command_runner,
-    )
+    temporary = destination.with_name(f"{destination.stem}.part{destination.suffix}")
+    temporary.unlink(missing_ok=True)
+    try:
+        _run_ffmpeg(
+            [
+                ffmpeg,
+                "-y",
+                "-nostdin",
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(temporary),
+            ],
+            command_runner,
+        )
+        if not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise LocalProcessingError("FFmpeg не создал аудиофайл для распознавания.")
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _extract_frames(
@@ -318,29 +525,60 @@ def _extract_frames(
     interval_seconds: int,
     command_runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    _run_ffmpeg(
-        [
-            ffmpeg,
-            "-y",
-            "-nostdin",
-            "-i",
-            str(source),
-            "-vf",
-            f"fps=1/{interval_seconds}",
-            "-q:v",
-            "3",
-            str(frames_dir / "frame-%04d.jpg"),
-        ],
-        command_runner,
-    )
+    temporary_dir = frames_dir.with_name(f"{frames_dir.name}.part")
+    if temporary_dir.exists():
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _run_ffmpeg(
+            [
+                ffmpeg,
+                "-y",
+                "-nostdin",
+                "-i",
+                str(source),
+                "-vf",
+                f"fps=1/{interval_seconds}",
+                "-q:v",
+                "3",
+                str(temporary_dir / "frame-%04d.jpg"),
+            ],
+            command_runner,
+        )
+        if not any(temporary_dir.glob("frame-*.jpg")):
+            raise LocalProcessingError("FFmpeg не создал кадры демонстрации экрана.")
+        (temporary_dir / "interval-seconds.txt").write_text(
+            str(interval_seconds),
+            encoding="ascii",
+        )
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        temporary_dir.replace(frames_dir)
+    except Exception:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+        raise
 
 
 def _run_ffmpeg(
     command: list[str],
     command_runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    result = command_runner(command, capture_output=True, text=True, check=False)
+    try:
+        result = command_runner(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30 * 60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LocalProcessingError(
+            "FFmpeg не завершил обработку за 30 минут. Проверь файл записи и повтори попытку."
+        ) from exc
+    except OSError as exc:
+        raise LocalProcessingError(
+            "Не удалось запустить FFmpeg. Повтори локальную установку инструментов."
+        ) from exc
     if result.returncode != 0:
         raise LocalProcessingError(
             "FFmpeg не смог подготовить файл. Проверь доступность записи и свободное место на диске."
@@ -363,10 +601,19 @@ def _read_frames(
     frames: list[Path],
     interval_seconds: int,
     reader: Callable[[Path], str | None],
+    *,
+    progress: ProgressCallback | None = None,
 ) -> tuple[ScreenNote, ...]:
     notes: list[ScreenNote] = []
+    notify = progress or _do_nothing
+    failure_count = 0
+    frame_count = len(frames)
     for index, frame in enumerate(frames):
-        text = reader(frame)
+        try:
+            text = reader(frame)
+        except Exception:
+            failure_count += 1
+            text = None
         if text:
             notes.append(
                 ScreenNote(
@@ -375,7 +622,32 @@ def _read_frames(
                     text=text,
                 )
             )
+        completed = index + 1
+        percent = 88 + (int(completed * 7 / frame_count) if frame_count else 7)
+        notify(
+            min(percent, 95),
+            f"OCR экрана: обработано кадров {completed} из {frame_count}…",
+        )
+    if failure_count:
+        notify(
+            95,
+            f"OCR завершён: кадров {frame_count}, пропущено из-за ошибок {failure_count}.",
+        )
+    if frame_count and failure_count == frame_count:
+        raise LocalProcessingError(
+            "Tesseract не смог обработать ни одного кадра. Повтори OCR: транскрипция и кадры уже сохранены."
+        )
     return tuple(notes)
+
+
+def _screen_notes_cache_is_valid(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, list)
 
 
 def _extension_from_url(url: str) -> str:

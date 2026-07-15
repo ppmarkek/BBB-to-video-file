@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from konspekt.bbb_import import BBBRecording, inspect_bbb_recording, load_library, save_to_library
+from konspekt.bbb_import import (
+    BBBImportError,
+    BBBRecording,
+    inspect_bbb_recording,
+    load_library,
+    save_to_library,
+)
 
 
 MEETING_ID = "f0a35ad2f6165a2fbce2f5d9e6ca241673f63bf8-1758353019485"
@@ -36,6 +42,15 @@ class FakeSession:
 
 
 class BBBImportTests(unittest.TestCase):
+    def test_rejects_path_traversal_in_meeting_id(self) -> None:
+        url = (
+            "https://bbb.example.test/playback/presentation/2.0/playback.html"
+            "?meetingId=..%2F..%2Foutside"
+        )
+
+        with self.assertRaises(BBBImportError):
+            inspect_bbb_recording(url, session=FakeSession({}))
+
     def test_inspects_media_title_and_slide_text(self) -> None:
         session = FakeSession(
             {
@@ -74,6 +89,38 @@ class BBBImportTests(unittest.TestCase):
 
         self.assertEqual(len(loaded), 1)
         self.assertIsInstance(loaded[0], BBBRecording)
+
+    def test_keeps_same_meeting_id_from_different_bbb_hosts(self) -> None:
+        first = inspect_bbb_recording(
+            PLAYBACK_URL,
+            session=FakeSession(
+                {
+                    "metadata.xml": '<recording><meeting name="First host" /></recording>',
+                    "presentation_text.json": "{}",
+                    "slides_new.xml": "<popcorn />",
+                }
+            ),
+        )
+        second = BBBRecording(
+            meeting_id=first.meeting_id,
+            source_url=first.source_url.replace("bbb-lb.tsi.lv", "bbb.other.test"),
+            title="Second host",
+            imported_at="2026-07-15T11:00:00+00:00",
+            audio_video_url=first.audio_video_url.replace(
+                "bbb-lb.tsi.lv", "bbb.other.test"
+            ),
+            screen_video_url=None,
+            slides=(),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "library.json"
+            save_to_library(first, path)
+            save_to_library(second, path)
+            loaded = load_library(path)
+
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual({item.title for item in loaded}, {"First host", "Second host"})
 
 
 if __name__ == "__main__":

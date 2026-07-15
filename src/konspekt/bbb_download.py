@@ -17,6 +17,9 @@ import requests
 from tqdm import tqdm
 
 
+MEETING_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
+
+
 @dataclass(frozen=True)
 class RecordingInfo:
     host: str
@@ -30,16 +33,20 @@ class RecordingInfo:
 
 def parse_playback_url(url: str) -> RecordingInfo:
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"Invalid URL: {url}")
 
     meeting_ids = parse_qs(parsed.query).get("meetingId")
     if not meeting_ids or not meeting_ids[0].strip():
         raise ValueError("URL must contain meetingId query parameter")
 
+    meeting_id = meeting_ids[0].strip()
+    if not MEETING_ID_PATTERN.fullmatch(meeting_id):
+        raise ValueError("meetingId contains unsupported characters")
+
     return RecordingInfo(
         host=parsed.netloc,
-        meeting_id=meeting_ids[0].strip(),
+        meeting_id=meeting_id,
         scheme=parsed.scheme,
     )
 

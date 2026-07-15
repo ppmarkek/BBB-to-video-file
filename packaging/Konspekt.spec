@@ -5,7 +5,12 @@ from pathlib import Path
 import os
 import shutil
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_dynamic_libs,
+    get_package_paths,
+)
 
 
 project_root = Path(SPECPATH).parent
@@ -31,6 +36,26 @@ for package in (
     binaries.extend(package_binaries)
     hiddenimports.extend(package_hiddenimports)
 
+# Keep the personal ChatGPT sign-in surface Windows-only and WebView2-only.
+# pywebview loads its WinForms backend dynamically, while pythonnet's `clr`
+# hook is responsible for the managed runtime bridge.
+datas.extend(collect_data_files("webview", subdir="js"))
+
+for source, destination in collect_dynamic_libs("webview"):
+    source_path = Path(source)
+    if source_path.name in {
+        "Microsoft.Web.WebView2.Core.dll",
+        "Microsoft.Web.WebView2.WinForms.dll",
+        "WebView2Loader.dll",
+    }:
+        binaries.append((source, destination))
+
+_, pythonnet_root = get_package_paths("pythonnet")
+python_runtime = Path(pythonnet_root) / "runtime" / "Python.Runtime.dll"
+if not python_runtime.is_file():
+    raise SystemExit("Python.Runtime.dll is required to package the WebView2 sign-in window.")
+binaries.append((str(python_runtime), "pythonnet/runtime"))
+
 hiddenimports.extend(
     [
         "faster_whisper",
@@ -39,6 +64,12 @@ hiddenimports.extend(
         "tokenizers",
         "huggingface_hub",
         "imageio_ffmpeg",
+        "webview",
+        "webview.platforms.winforms",
+        "webview.platforms.edgechromium",
+        "clr",
+        "pythonnet",
+        "clr_loader",
     ]
 )
 
@@ -71,6 +102,26 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+# pywebview ships a generic hook for every supported renderer/platform. Trim its
+# Windows payload to EdgeChromium. Version 6.2.1 probes all three native-loader
+# directories at import time, so each loader is required even in an x64 build.
+allowed_webview_libs = {
+    "webview/lib/Microsoft.Web.WebView2.Core.dll",
+    "webview/lib/Microsoft.Web.WebView2.WinForms.dll",
+    "webview/lib/runtimes/win-arm64/native/WebView2Loader.dll",
+    "webview/lib/runtimes/win-x64/native/WebView2Loader.dll",
+    "webview/lib/runtimes/win-x86/native/WebView2Loader.dll",
+}
+
+
+def keep_webview_runtime(entry):
+    destination = entry[0].replace("\\", "/")
+    return not destination.startswith("webview/lib/") or destination in allowed_webview_libs
+
+
+a.datas = [entry for entry in a.datas if keep_webview_runtime(entry)]
+a.binaries = [entry for entry in a.binaries if keep_webview_runtime(entry)]
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
