@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from tkinter import font, ttk
 
 from bbb_import import BBBImportError, BBBRecording, inspect_bbb_recording, load_library, save_to_library
+from local_pipeline import LocalProcessingError, lecture_is_prepared, prepare_lecture
 
 
 PALETTE = {
@@ -64,6 +65,9 @@ class StudyApp(tk.Tk):
         self._import_status = tk.StringVar()
         self._import_button: ttk.Button | None = None
         self._import_status_label: tk.Label | None = None
+        self._processing_status = tk.StringVar()
+        self._processing_progress: ttk.Progressbar | None = None
+        self._processing_return_button: ttk.Button | None = None
 
         self._build_shell()
         self.show_library(animated=False)
@@ -363,14 +367,19 @@ class StudyApp(tk.Tk):
                 foreground=PALETTE["muted"],
                 background=PALETTE["surface_soft"],
             ).grid(row=1, column=0, sticky="w", pady=(7, 0))
-            tk.Label(
+            prepared = lecture_is_prepared(recording)
+            action_text = "Материалы готовы" if prepared else "Подготовить"
+            action_style = "Secondary.TButton" if prepared else "Primary.TButton"
+            action = (
+                self.show_library
+                if prepared
+                else lambda item=recording: self.start_local_processing(item)
+            )
+            ttk.Button(
                 row,
-                text="Готово к обработке",
-                font=self.type.small,
-                foreground=PALETTE["success"],
-                background=PALETTE["primary_soft"],
-                padx=9,
-                pady=5,
+                text=action_text,
+                style=action_style,
+                command=action,
             ).grid(row=0, column=1, rowspan=2, sticky="e")
 
     def show_new_lecture(self) -> None:
@@ -545,6 +554,119 @@ class StudyApp(tk.Tk):
             return load_library()
         except BBBImportError:
             return []
+
+    def start_local_processing(self, recording: BBBRecording) -> None:
+        self._processing_status.set("Подготовка начнётся после проверки локальных инструментов…")
+        self.show_processing_screen(recording)
+        threading.Thread(
+            target=self._local_processing_worker,
+            args=(recording,),
+            daemon=True,
+        ).start()
+
+    def show_processing_screen(self, recording: BBBRecording) -> None:
+        screen = ttk.Frame(self.content, style="TFrame")
+        screen.configure(padding=(40, 40, 40, 40))
+        screen.grid_columnconfigure(0, weight=1)
+        screen.grid_rowconfigure(1, weight=1)
+
+        tk.Label(
+            screen,
+            text="Подготавливаем материалы",
+            font=self.type.title,
+            foreground=PALETTE["ink"],
+            background=PALETTE["canvas"],
+        ).grid(row=0, column=0, sticky="w")
+
+        panel = tk.Frame(
+            screen,
+            background=PALETTE["surface_soft"],
+            highlightbackground=PALETTE["line"],
+            highlightthickness=1,
+            padx=28,
+            pady=28,
+        )
+        panel.grid(row=1, column=0, sticky="nsew", pady=(26, 0))
+        panel.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            panel,
+            text=recording.title,
+            font=self.type.heading,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            panel,
+            text="Аудио и кадры будут обработаны на этом компьютере. Платные API не используются.",
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=1, column=0, sticky="w", pady=(8, 22))
+        self._processing_progress = ttk.Progressbar(panel, mode="indeterminate")
+        self._processing_progress.grid(row=2, column=0, sticky="ew")
+        self._processing_progress.start(12)
+        tk.Label(
+            panel,
+            textvariable=self._processing_status,
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+            justify="left",
+            wraplength=720,
+        ).grid(row=3, column=0, sticky="w", pady=(18, 20))
+        self._processing_return_button = ttk.Button(
+            panel,
+            text="Вернуться в библиотеку",
+            style="Secondary.TButton",
+            command=self.show_library,
+            state="disabled",
+        )
+        self._processing_return_button.grid(row=4, column=0, sticky="w")
+
+        self._show_screen(screen, animated=True)
+
+    def _local_processing_worker(self, recording: BBBRecording) -> None:
+        try:
+            prepared = prepare_lecture(
+                recording,
+                progress=lambda message: self.after(
+                    0,
+                    lambda: self._processing_status.set(message),
+                ),
+            )
+        except LocalProcessingError as exc:
+            self.after(0, lambda: self._finish_processing_error(str(exc)))
+        except Exception:
+            self.after(
+                0,
+                lambda: self._finish_processing_error(
+                    "Подготовка остановлена из-за неожиданной ошибки. Исходная запись сохранена в библиотеке."
+                ),
+            )
+        else:
+            self.after(0, lambda: self._finish_processing_success(prepared))
+
+    def _finish_processing_success(self, prepared) -> None:
+        if self._processing_progress is not None and self._processing_progress.winfo_exists():
+            self._processing_progress.stop()
+        ocr = "и OCR экрана" if prepared.screen_notes_path else "без OCR экрана"
+        self._processing_status.set(
+            f"Готово: транскрипция, {prepared.frame_count} кадров {ocr} сохранены локально."
+        )
+        self._enable_processing_return()
+
+    def _finish_processing_error(self, message: str) -> None:
+        if self._processing_progress is not None and self._processing_progress.winfo_exists():
+            self._processing_progress.stop()
+        self._processing_status.set(message)
+        self._enable_processing_return()
+
+    def _enable_processing_return(self) -> None:
+        if (
+            self._processing_return_button is not None
+            and self._processing_return_button.winfo_exists()
+        ):
+            self._processing_return_button.state(["!disabled"])
 
     def _show_screen(self, screen: ttk.Frame, animated: bool) -> None:
         previous = self._current_screen

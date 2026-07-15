@@ -1,0 +1,2 @@
+# Local and free speech recognition. No API key is required.
+faster-whisper>=1.1.0
