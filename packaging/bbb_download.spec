@@ -1,16 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+project_root = Path(SPECPATH).parent
+source_root = project_root / "src"
+package_root = source_root / "konspekt"
 
 imageio_ffmpeg_datas, imageio_ffmpeg_binaries, imageio_ffmpeg_hiddenimports = collect_all(
     "imageio_ffmpeg"
 )
 
 a = Analysis(
-    ['bbb_download.py'],
-    pathex=[],
+    [str(package_root / "bbb_download.py")],
+    pathex=[str(source_root)],
     binaries=imageio_ffmpeg_binaries,
     datas=imageio_ffmpeg_datas,
     hiddenimports=['requests', 'tqdm', 'certifi', 'imageio_ffmpeg', *imageio_ffmpeg_hiddenimports],
@@ -45,5 +50,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/logo.ico',
+    icon=str(project_root / 'assets' / 'konspekt.ico'),
 )

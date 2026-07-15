@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from bbb_import import BBBRecording
-from local_pipeline import default_lecture_directory
+from .bbb_import import BBBRecording
+from .local_pipeline import default_lecture_directory
 
 
 DEEPSEEK_URL = "https://chat.deepseek.com/"

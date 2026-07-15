@@ -1,134 +1,81 @@
-# BBB-to-video-file
+# Konspekt
 
-![Logo](assets/logo.png)
+![Konspekt icon](assets/konspekt.svg)
 
-Скачивает видео из записей BigBlueButton по ссылке playback и собирает один MP4.
+Windows-приложение для превращения записей BigBlueButton в аккуратные учебные материалы. Оно локально скачивает необходимые дорожки записи, распознаёт речь и текст на экране, собирает контекст и помогает сохранить готовый `lesson.md`.
 
-## Что скачивается
+## Что работает локально
 
-Из URL вида:
+- импорт публичной BBB-записи по ссылке playback;
+- извлечение аудио и кадров экрана через FFmpeg;
+- транскрибация Faster-Whisper на компьютере;
+- OCR кадров через Tesseract;
+- контекст для ChatGPT или DeepSeek и сохранение итогового Markdown;
+- отображение этапов обработки с процентами.
 
-`https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=...`
+Аудио, кадры и транскрипция не отправляются в API. При первой транскрибации Faster-Whisper один раз скачает открытую модель `small`; это не расходует API-токены.
 
-программа загружает:
+## Быстрый старт для разработки
 
-| Файл | Содержимое |
-|------|------------|
-| `video/webcams.webm` | Камера + звук |
-| `deskshare/deskshare.webm` | Презентация / демонстрация экрана |
+1. Установи Python 3.10+ и открой PowerShell в папке проекта.
+2. Выполни:
 
-Затем ffmpeg конвертирует webm в MP4 и собирает `{meetingId}_merged.mp4`: презентация слева, камера справа, звук из webcams.
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -e ".[local-ai]"
+   .\.venv\Scripts\pythonw.exe -m konspekt
+   ```
 
-## Требования
+3. В приложении добавь ссылку BBB, нажми «Подготовить», затем «Собрать пакет».
 
-- Python 3.10+
-- [ffmpeg](https://ffmpeg.org/) в PATH (опционально — в exe уже встроен)
+`scripts\setup_local_ai.ps1` и `scripts\run_konspekt.bat` делают то же самое. Прямые команды выше пригодятся, если Windows запрещает запуск `.ps1`-сценариев.
 
-Для сборки из исходников ffmpeg подтягивается автоматически через `imageio-ffmpeg`.
-
-По умолчанию используется **GPU-кодирование** (NVIDIA NVENC → AMD AMF → Intel QSV), если доступно. При ошибке — автоматический fallback на CPU. Принудительно CPU:
-
-```powershell
-bbb-download.exe --cpu
-```
-
-## Установка (локальные библиотеки в `.venv`)
+Для OCR экрана установи Tesseract:
 
 ```powershell
-cd BBB-to-video-file
-.\setup.ps1
-.\.venv\Scripts\Activate.ps1
+winget install UB-Mannheim.TesseractOCR
 ```
 
-Или вручную:
+Подробности: [локальная обработка](docs/local-ai.md).
+
+## Готовая Windows-версия
+
+Собери приложение командой:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\pip install -r requirements-dev.txt
+.\scripts\build_konspekt.ps1
 ```
 
-## Сборка EXE
+Результат: `dist\Konspekt\Konspekt.exe`. Копируй всю папку `dist\Konspekt`, а не только `.exe`: рядом лежат FFmpeg, Tesseract, локальные библиотеки и иконка приложения. Инструкция для получателя: [docs/release.md](docs/release.md).
+
+## Структура проекта
+
+```text
+src/konspekt/          исходный код приложения и BBB CLI
+tests/                 модульные тесты
+assets/                единая SVG, PNG и ICO-иконка Konspekt
+scripts/               настройка, запуск, сборка и генерация иконки
+packaging/             PyInstaller-спецификации
+docs/                  инструкции по локальному ИИ и выпуску
+pyproject.toml         зависимости и точки входа пакета
+```
+
+Основной запуск — `python -m konspekt` или команда `konspekt` после установки пакета. Корневые `study_app.py` и `bbb_import.py` оставлены только как короткие совместимые обёртки для старых запусков.
+
+## Проверка
 
 ```powershell
-.\build.ps1
+$env:PYTHONDONTWRITEBYTECODE = '1'
+$env:PYTHONPATH = "$PWD\src"
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Готовый файл: `dist\bbb-download.exe` (иконка: `assets/logo.ico`)
+## Дополнительная CLI-утилита
 
-Пересобрать иконку из PNG:
+Старый BBB-загрузчик сохранён отдельно от интерфейса. Он скачивает запись и при необходимости собирает MP4:
 
 ```powershell
-python scripts/make_icon.py
-.\build.ps1
+python -m konspekt.bbb_download "https://host/playback/presentation/2.0/playback.html?meetingId=..."
 ```
 
-ffmpeg по-прежнему нужен отдельно — он не входит в exe и должен быть в PATH для сборки MP4.
-
-## Использование
-
-### Способ 1 — двойной клик (проще всего)
-
-1. Откройте папку `dist\`
-2. Запустите **`run.bat`** или **`bbb-download.exe`**
-3. Вставьте ссылку playback и нажмите Enter
-4. После обработки можно вставить **ещё одну ссылку** или нажать Enter для выхода
-
-Пример ссылки:
-
-`https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=728ac075c4b73cbef0bbb015e68bd08ee0629c9e-1758971622609`
-
-Скопируйте её из браузера (адресная строка на странице просмотра записи BBB).
-
-### Способ 2 — PowerShell / CMD
-
-```powershell
-cd dist
-.\bbb-download.exe "https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=728ac075c4b73cbef0bbb015e68bd08ee0629c9e-1758971622609"
-```
-
-Или перетащите ссылку через bat-файл:
-
-```powershell
-.\dist\run.bat "https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=..."
-```
-
-### EXE
-
-```powershell
-.\dist\bbb-download.exe "https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=728ac075c4b73cbef0bbb015e68bd08ee0629c9e-1758971622609"
-```
-
-### Python
-
-Скачать и собрать MP4:
-
-```powershell
-python bbb_download.py "https://bbb-lb.tsi.lv/playback/presentation/2.0/playback.html?meetingId=728ac075c4b73cbef0bbb015e68bd08ee0629c9e-1758971622609"
-```
-
-Указать папку вывода:
-
-```powershell
-python bbb_download.py URL -o ./my_recordings
-```
-
-Только скачать и конвертировать в MP4 без общего merged-файла:
-
-```powershell
-python bbb_download.py URL --no-merge
-```
-
-## Результат
-
-По умолчанию файлы сохраняются в `./downloads/<meetingId>/`:
-
-- `webcams.mp4` — камера + звук (конвертируется сразу после скачивания)
-- `deskshare.mp4` — презентация (если есть)
-- `{meetingId}_merged.mp4` — итоговое видео (презентация + камера)
-
-## Ограничения
-
-- Запись должна быть опубликована и доступна без авторизации.
-- Чат, курсор и аннотации на слайдах в MP4 не включаются.
-- Если презентация была только через загруженные слайды (без deskshare), будет сохранён только webcams.
-- Сборка больших записей может занять несколько минут.
+Для него есть отдельная сборка: `scripts\build_bbb_downloader.ps1`.

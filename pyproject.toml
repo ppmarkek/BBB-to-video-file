@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "konspekt"
+version = "0.1.0"
+description = "A local Windows app that turns BBB lecture recordings into structured study notes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "imageio-ffmpeg>=0.5.0",
+    "requests>=2.24.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+local-ai = ["faster-whisper>=1.1.0"]
+dev = [
+    "pillow>=10.0.0",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+konspekt = "konspekt.app:main"
+bbb-download = "konspekt.bbb_download:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

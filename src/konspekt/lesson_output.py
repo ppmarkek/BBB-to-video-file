@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from bbb_import import BBBRecording
-from local_pipeline import default_lecture_directory
+from .bbb_import import BBBRecording
+from .local_pipeline import default_lecture_directory
 
 
 class LessonOutputError(RuntimeError):

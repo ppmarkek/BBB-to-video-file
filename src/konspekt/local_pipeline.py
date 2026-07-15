@@ -14,15 +14,17 @@ from urllib.parse import urlparse
 
 import requests
 
-from bbb_download import resolve_ffmpeg
-from bbb_import import BBBRecording, default_library_path
+from .bbb_download import resolve_ffmpeg
+from .bbb_import import BBBRecording, default_library_path
 
 
 class LocalProcessingError(RuntimeError):
     """The local lecture pipeline cannot continue until a local dependency is ready."""
 
 
-ProgressCallback = Callable[[str], None]
+ProgressCallback = Callable[[int, str], None]
+DownloadProgressCallback = Callable[[str], None]
+MediaDownloader = Callable[[str, Path, DownloadProgressCallback | None], None]
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,7 @@ def prepare_lecture(
     language: str | None = None,
     frame_interval_seconds: int = 30,
     progress: ProgressCallback | None = None,
-    downloader: Callable[[str, Path, ProgressCallback | None], None] = None,
+    downloader: MediaDownloader | None = None,
     transcriber: LocalTranscriber | None = None,
     ocr_reader: Callable[[Path], str | None] | None = None,
     command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
@@ -96,33 +98,46 @@ def prepare_lecture(
             "FFmpeg не найден. Запусти .\\setup_local_ai.ps1, затем повтори подготовку."
         )
 
-    notify("Скачиваем дорожку с голосом преподавателя…")
+    notify(4, "Проверяем локальные инструменты…")
+    notify(10, "Скачиваем дорожку с голосом преподавателя…")
     webcam_path = target / f"webcams{_extension_from_url(recording.audio_video_url)}"
     if not webcam_path.is_file():
-        download(recording.audio_video_url, webcam_path, notify)
+        download(
+            recording.audio_video_url,
+            webcam_path,
+            lambda message: notify(22, message),
+        )
+    notify(24, "Дорожка с голосом готова.")
 
     audio_path = target / "audio.wav"
     if not audio_path.is_file():
-        notify("Извлекаем аудио локально…")
+        notify(30, "Извлекаем аудио локально…")
         _extract_audio(ffmpeg, webcam_path, audio_path, command_runner)
+    notify(36, "Аудио подготовлено.")
 
-    notify("Распознаём речь локальной моделью Whisper…")
+    notify(40, "Распознаём речь локальной моделью Whisper…")
     recognise = transcriber or faster_whisper_transcribe(model_name)
     segments = tuple(recognise(audio_path, language))
     transcript_path = target / "transcript.md"
+    notify(62, "Сохраняем транскрипцию…")
     _write_transcript(target, segments)
+    notify(66, "Транскрипция готова.")
 
     screen_notes_path: Path | None = None
     frame_count = 0
     if recording.screen_video_url:
-        notify("Скачиваем демонстрацию экрана…")
+        notify(70, "Скачиваем демонстрацию экрана…")
         screen_path = target / f"deskshare{_extension_from_url(recording.screen_video_url)}"
         if not screen_path.is_file():
-            download(recording.screen_video_url, screen_path, notify)
+            download(
+                recording.screen_video_url,
+                screen_path,
+                lambda message: notify(76, message),
+            )
 
         frames_dir = target / "frames"
         if not any(frames_dir.glob("frame-*.jpg")):
-            notify("Выбираем кадры экрана каждые 30 секунд…")
+            notify(80, "Выбираем кадры экрана каждые 30 секунд…")
             _extract_frames(
                 ffmpeg,
                 screen_path,
@@ -136,17 +151,18 @@ def prepare_lecture(
         if ocr_reader is None:
             ocr_reader = default_ocr_reader()
         if ocr_reader is not None:
-            notify("Распознаём текст на экране локально…")
+            notify(88, "Распознаём текст на экране локально…")
             notes = _read_frames(frames, frame_interval_seconds, ocr_reader)
             screen_notes_path = target / "screen-notes.json"
+            notify(96, "Сохраняем заметки с экрана…")
             screen_notes_path.write_text(
                 json.dumps([asdict(note) for note in notes], ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         else:
-            notify("Кадры сохранены. OCR пропущен: Tesseract пока не установлен.")
+            notify(96, "Кадры сохранены. OCR пропущен: Tesseract пока не установлен.")
 
-    notify("Материалы готовы для следующего шага.")
+    notify(100, "Материалы готовы для следующего шага.")
     return PreparedLecture(
         directory=target,
         audio_path=audio_path,
@@ -156,7 +172,11 @@ def prepare_lecture(
     )
 
 
-def download_media(url: str, destination: Path, progress: ProgressCallback | None = None) -> None:
+def download_media(
+    url: str,
+    destination: Path,
+    progress: DownloadProgressCallback | None = None,
+) -> None:
     """Download one public BBB asset with bounded, local file handling."""
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -370,5 +390,5 @@ def _format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minute:02d}:{second:02d}"
 
 
-def _do_nothing(_: str) -> None:
+def _do_nothing(_: int, __: str) -> None:
     pass

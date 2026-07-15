@@ -8,9 +8,13 @@ import shutil
 from PyInstaller.utils.hooks import collect_all
 
 
-project_root = Path(SPECPATH)
+project_root = Path(SPECPATH).parent
+source_root = project_root / "src"
+package_root = source_root / "konspekt"
 block_cipher = None
-datas: list[tuple[str, str]] = []
+datas: list[tuple[str, str]] = [
+    (str(project_root / "assets" / "konspekt.png"), "assets"),
+]
 binaries: list[tuple[str, str]] = []
 hiddenimports: list[str] = []
 
@@ -56,8 +60,8 @@ for file_path in tesseract_root.rglob("*"):
         datas.append((str(file_path), str(destination)))
 
 a = Analysis(
-    [str(project_root / "study_app.py")],
-    pathex=[str(project_root)],
+    [str(package_root / "__main__.py")],
+    pathex=[str(source_root)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -81,7 +85,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    icon=str(project_root / "assets" / "logo.ico"),
+    icon=str(project_root / "assets" / "konspekt.ico"),
 )
 
 coll = COLLECT(

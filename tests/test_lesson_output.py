@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_import import BBBRecording
-from lesson_output import (
+from konspekt.bbb_import import BBBRecording
+from konspekt.lesson_output import (
     LessonOutputError,
     lesson_is_ready,
     read_generated_lesson,

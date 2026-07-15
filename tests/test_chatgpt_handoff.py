@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_import import BBBRecording
-from chatgpt_handoff import (
+from konspekt.bbb_import import BBBRecording
+from konspekt.chatgpt_handoff import (
     CHATGPT_URL,
     ChatGPTHandoffError,
     launch_chatgpt_handoff,

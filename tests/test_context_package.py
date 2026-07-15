@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_import import BBBRecording, SlideInfo
-from context_package import ContextPackageError, build_context_package
+from konspekt.bbb_import import BBBRecording, SlideInfo
+from konspekt.context_package import ContextPackageError, build_context_package
 
 
 class ContextPackageTests(unittest.TestCase):
@@ -26,6 +26,7 @@ class ContextPackageTests(unittest.TestCase):
         )
 
     def test_builds_attachable_context_and_prompt_without_llm(self) -> None:
+        progress_updates: list[tuple[int, str]] = []
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             (directory / "transcript.json").write_text(
@@ -48,7 +49,11 @@ class ContextPackageTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            package = build_context_package(self.recording, directory=directory)
+            package = build_context_package(
+                self.recording,
+                directory=directory,
+                progress=lambda percent, message: progress_updates.append((percent, message)),
+            )
             markdown = package.markdown_path.read_text(encoding="utf-8")
             prompt = package.prompt_path.read_text(encoding="utf-8")
             payload = json.loads(package.json_path.read_text(encoding="utf-8"))
@@ -61,6 +66,7 @@ class ContextPackageTests(unittest.TestCase):
         self.assertEqual(markdown.count("Diagram A"), 1)
         self.assertIn("создания lesson.md", prompt)
         self.assertEqual(payload["lecture"]["meeting_id"], "meeting-context")
+        self.assertEqual(progress_updates[-1][0], 100)
 
     def test_requires_a_prepared_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

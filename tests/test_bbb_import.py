@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_import import BBBRecording, inspect_bbb_recording, load_library, save_to_library
+from konspekt.bbb_import import BBBRecording, inspect_bbb_recording, load_library, save_to_library
 
 
 MEETING_ID = "f0a35ad2f6165a2fbce2f5d9e6ca241673f63bf8-1758353019485"

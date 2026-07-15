@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bbb_import import BBBRecording
-from deepseek_handoff import (
+from konspekt.bbb_import import BBBRecording
+from konspekt.deepseek_handoff import (
     DEEPSEEK_URL,
     DeepSeekHandoffError,
     launch_deepseek_handoff,

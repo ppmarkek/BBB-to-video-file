@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bbb_import import BBBRecording
-from local_pipeline import TranscriptSegment, prepare_lecture
+from konspekt.bbb_import import BBBRecording
+from konspekt.local_pipeline import TranscriptSegment, prepare_lecture
 
 
 class LocalPipelineTests(unittest.TestCase):
@@ -29,6 +29,8 @@ class LocalPipelineTests(unittest.TestCase):
         def transcribe(_: Path, __: str | None) -> tuple[TranscriptSegment, ...]:
             return (TranscriptSegment(1.2, 4.8, "Hello local transcription"),)
 
+        progress_updates: list[tuple[int, str]] = []
+
         def run_ffmpeg(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             output = Path(command[-1])
             if "frame-%04d.jpg" in str(output):
@@ -41,7 +43,7 @@ class LocalPipelineTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as temporary:
-            with patch("local_pipeline.resolve_ffmpeg", return_value="ffmpeg"):
+            with patch("konspekt.local_pipeline.resolve_ffmpeg", return_value="ffmpeg"):
                 prepared = prepare_lecture(
                     recording,
                     directory=Path(temporary),
@@ -49,6 +51,7 @@ class LocalPipelineTests(unittest.TestCase):
                     transcriber=transcribe,
                     ocr_reader=lambda frame: f"Text from {frame.name}",
                     command_runner=run_ffmpeg,
+                    progress=lambda percent, message: progress_updates.append((percent, message)),
                 )
 
             transcript = prepared.transcript_path.read_text(encoding="utf-8")
@@ -58,6 +61,11 @@ class LocalPipelineTests(unittest.TestCase):
         self.assertIn("Hello local transcription", transcript)
         self.assertIn("frame-0002.jpg", notes)
         self.assertEqual(prepared.frame_count, 2)
+        self.assertEqual(progress_updates[-1][0], 100)
+        self.assertEqual(
+            [percent for percent, _ in progress_updates],
+            sorted(percent for percent, _ in progress_updates),
+        )
 
     def test_reuses_existing_audio_and_skips_screen_when_absent(self) -> None:
         recording = BBBRecording(
@@ -78,7 +86,7 @@ class LocalPipelineTests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"audio")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with patch("local_pipeline.resolve_ffmpeg", return_value="ffmpeg"):
+            with patch("konspekt.local_pipeline.resolve_ffmpeg", return_value="ffmpeg"):
                 prepared = prepare_lecture(
                     recording,
                     directory=target,

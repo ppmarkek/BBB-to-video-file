@@ -7,15 +7,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from bbb_import import BBBRecording, SlideInfo
-from local_pipeline import ScreenNote, TranscriptSegment, default_lecture_directory
+from .bbb_import import BBBRecording, SlideInfo
+from .local_pipeline import ScreenNote, TranscriptSegment, default_lecture_directory
 
 
 class ContextPackageError(RuntimeError):
     """The prepared lecture files cannot be turned into a chat context yet."""
 
 
-ProgressCallback = Callable[[str], None]
+ProgressCallback = Callable[[int, str], None]
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,8 @@ def build_context_package(
             "Сначала подготовь материалы лекции: не найден файл транскрипции."
         )
 
-    notify("Собираем транскрипцию по временным блокам…")
+    notify(10, "Проверяем подготовленные материалы…")
+    notify(25, "Собираем транскрипцию по временным блокам…")
     segments = _read_transcript(transcript_path)
     blocks = _group_transcript(
         segments,
@@ -72,7 +73,7 @@ def build_context_package(
         max_block_characters=max_block_characters,
     )
 
-    notify("Объединяем текст слайдов и заметки с экрана…")
+    notify(55, "Объединяем текст слайдов и заметки с экрана…")
     slides = _unique_slides(recording.slides)
     screen_notes = _read_screen_notes(target / "screen-notes.json")
 
@@ -91,6 +92,7 @@ def build_context_package(
     json_path = target / "lesson-context.json"
     markdown_path = target / "lesson-context.md"
     prompt_path = target / "lesson-prompt.md"
+    notify(78, "Создаём Markdown и структурированные данные…")
     json_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -100,7 +102,7 @@ def build_context_package(
         encoding="utf-8",
     )
     prompt_path.write_text(_render_lesson_prompt(recording.title), encoding="utf-8")
-    notify("Пакет контекста готов для прикрепления в чат.")
+    notify(100, "Пакет контекста готов для прикрепления в чат.")
 
     return ContextPackage(
         directory=target,
@@ -306,5 +308,5 @@ def _format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minute:02d}:{second:02d}"
 
 
-def _do_nothing(_: str) -> None:
+def _do_nothing(_: int, __: str) -> None:
     pass
