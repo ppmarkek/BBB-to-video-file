@@ -1,0 +1,103 @@
+"""Prepare a user-controlled handoff from local lecture materials to DeepSeek Web."""
+
+from __future__ import annotations
+
+import os
+import webbrowser
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from bbb_import import BBBRecording
+from local_pipeline import default_lecture_directory
+
+
+DEEPSEEK_URL = "https://chat.deepseek.com/"
+
+
+class DeepSeekHandoffError(RuntimeError):
+    """The local package is not ready for a DeepSeek Web handoff."""
+
+
+@dataclass(frozen=True)
+class DeepSeekHandoff:
+    directory: Path
+    context_path: Path
+    prompt_path: Path
+    instructions_path: Path
+
+
+def prepare_deepseek_handoff(
+    recording: BBBRecording,
+    *,
+    directory: Path | None = None,
+) -> DeepSeekHandoff:
+    """Create a local checklist for the DeepSeek Web flow without an API call."""
+
+    target = directory or default_lecture_directory(recording)
+    context_path = target / "lesson-context.md"
+    prompt_path = target / "lesson-prompt.md"
+    missing = [path.name for path in (context_path, prompt_path) if not path.is_file()]
+    if missing:
+        raise DeepSeekHandoffError(
+            "Сначала собери пакет контекста: не найдены " + ", ".join(missing) + "."
+        )
+
+    instructions_path = target / "deepseek-handoff.md"
+    instructions_path.write_text(
+        _render_handoff_instructions(recording.title),
+        encoding="utf-8",
+    )
+    return DeepSeekHandoff(
+        directory=target,
+        context_path=context_path,
+        prompt_path=prompt_path,
+        instructions_path=instructions_path,
+    )
+
+
+def launch_deepseek_handoff(
+    handoff: DeepSeekHandoff,
+    *,
+    open_url: Callable[[str], bool] = webbrowser.open_new_tab,
+    open_directory: Callable[[Path], None] | None = None,
+) -> None:
+    """Open DeepSeek and the local context folder; the user chooses the chat and sends."""
+
+    if not handoff.context_path.is_file() or not handoff.prompt_path.is_file():
+        raise DeepSeekHandoffError("Пакет контекста больше недоступен в локальной папке.")
+
+    try:
+        opened = open_url(DEEPSEEK_URL)
+        if not opened:
+            raise RuntimeError("browser did not accept the address")
+        (open_directory or _open_in_file_manager)(handoff.directory)
+    except OSError as exc:
+        raise DeepSeekHandoffError("Не удалось открыть DeepSeek или папку с материалами.") from exc
+    except RuntimeError as exc:
+        raise DeepSeekHandoffError("Не удалось открыть DeepSeek в браузере по умолчанию.") from exc
+
+
+def _open_in_file_manager(directory: Path) -> None:
+    if os.name == "nt":
+        os.startfile(str(directory))
+        return
+    webbrowser.open_new_tab(directory.resolve().as_uri())
+
+
+def _render_handoff_instructions(title: str) -> str:
+    return f"""# Передача лекции в DeepSeek Web
+
+Лекция: **{title}**
+
+Этот этап не использует API. Приложение открывает chat.deepseek.com, папку с материалами и копирует инструкцию в буфер обмена. Самостоятельно выбрать чат, прикрепить файл и отправить сообщение должен пользователь.
+
+1. В DeepSeek выбери новый или подходящий существующий чат.
+2. Прикрепи файл lesson-context.md из этой папки.
+3. Вставь подготовленную инструкцию сочетанием Ctrl+V.
+4. Не включай веб-поиск: итоговый конспект должен опираться на приложенный контекст лекции.
+5. Проверь, что прикреплён именно файл контекста этой лекции, и отправь сообщение.
+6. Сохрани ответ DeepSeek как lesson.md в этой же папке.
+
+Если интерфейс не принимает файл, открой lesson-context.md в текстовом редакторе, вставь его содержимое в чат и затем добавь инструкцию из lesson-prompt.md.
+"""

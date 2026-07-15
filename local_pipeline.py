@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
@@ -211,27 +212,57 @@ def faster_whisper_transcribe(model_name: str) -> LocalTranscriber:
 
 
 def default_ocr_reader() -> Callable[[Path], str | None] | None:
-    executable = shutil.which("tesseract")
-    if not executable and os.name == "nt":
-        installed_path = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tesseract-OCR" / "tesseract.exe"
-        if installed_path.is_file():
-            executable = str(installed_path)
+    executable = _find_tesseract_executable()
     if not executable:
         return None
 
     def read(image_path: Path) -> str | None:
         preferred = [executable, str(image_path), "stdout", "-l", "eng+rus"]
-        result = subprocess.run(preferred, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            preferred,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_tesseract_environment(executable),
+        )
         if result.returncode != 0:
             result = subprocess.run(
                 [executable, str(image_path), "stdout"],
                 capture_output=True,
                 text=True,
                 check=False,
+                env=_tesseract_environment(executable),
             )
         return result.stdout.strip() or None
 
     return read
+
+
+def _find_tesseract_executable() -> str | None:
+    candidates = [shutil.which("tesseract")]
+    if os.name == "nt":
+        candidates.append(
+            str(
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "Tesseract-OCR"
+                / "tesseract.exe"
+            )
+        )
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    candidates.append(str(bundle_root / "tesseract" / "tesseract.exe"))
+
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _tesseract_environment(executable: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    tessdata = Path(executable).parent / "tessdata"
+    if tessdata.is_dir():
+        environment.setdefault("TESSDATA_PREFIX", str(tessdata))
+    return environment
 
 
 def _extract_audio(

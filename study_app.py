@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""The first desktop surface for the local lecture-study assistant.
-
-This module deliberately contains only the library and new-lecture entry flow.
-Importing BBB recordings and processing them is added in later stages.
-"""
+"""Windows interface for importing and preparing local lecture-study materials."""
 
 from __future__ import annotations
 
@@ -11,10 +7,34 @@ import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import font, ttk
+from tkinter import font, scrolledtext, ttk
 
 from bbb_import import BBBImportError, BBBRecording, inspect_bbb_recording, load_library, save_to_library
+from chatgpt_handoff import (
+    ChatGPTHandoff,
+    ChatGPTHandoffError,
+    launch_chatgpt_handoff,
+    prepare_chatgpt_handoff,
+)
+from context_package import (
+    ContextPackage,
+    ContextPackageError,
+    build_context_package,
+    context_package_is_ready,
+)
 from local_pipeline import LocalProcessingError, lecture_is_prepared, prepare_lecture
+from lesson_output import (
+    LessonOutputError,
+    lesson_is_ready,
+    read_generated_lesson,
+    save_generated_lesson,
+)
+from deepseek_handoff import (
+    DeepSeekHandoff,
+    DeepSeekHandoffError,
+    launch_deepseek_handoff,
+    prepare_deepseek_handoff,
+)
 
 
 PALETTE = {
@@ -68,6 +88,11 @@ class StudyApp(tk.Tk):
         self._processing_status = tk.StringVar()
         self._processing_progress: ttk.Progressbar | None = None
         self._processing_return_button: ttk.Button | None = None
+        self._handoff_status = tk.StringVar()
+        self._active_handoff: ChatGPTHandoff | DeepSeekHandoff | None = None
+        self._active_handoff_provider: str | None = None
+        self._lesson_status = tk.StringVar()
+        self._lesson_editor: scrolledtext.ScrolledText | None = None
 
         self._build_shell()
         self.show_library(animated=False)
@@ -368,18 +393,33 @@ class StudyApp(tk.Tk):
                 background=PALETTE["surface_soft"],
             ).grid(row=1, column=0, sticky="w", pady=(7, 0))
             prepared = lecture_is_prepared(recording)
-            action_text = "Материалы готовы" if prepared else "Подготовить"
-            action_style = "Secondary.TButton" if prepared else "Primary.TButton"
-            action = (
-                self.show_library
-                if prepared
-                else lambda item=recording: self.start_local_processing(item)
-            )
+            package_ready = prepared and context_package_is_ready(recording)
+            if lesson_is_ready(recording):
+                action_text = "Открыть конспект"
+                action_style = "Primary.TButton"
+                action = lambda item=recording: self.show_lesson_reader(item)
+                action_state = "normal"
+            elif not prepared:
+                action_text = "Подготовить"
+                action_style = "Primary.TButton"
+                action = lambda item=recording: self.start_local_processing(item)
+                action_state = "normal"
+            elif not package_ready:
+                action_text = "Собрать пакет"
+                action_style = "Primary.TButton"
+                action = lambda item=recording: self.start_context_packaging(item)
+                action_state = "normal"
+            else:
+                action_text = "Выбрать чат"
+                action_style = "Primary.TButton"
+                action = lambda item=recording: self.show_chat_provider_choice(item)
+                action_state = "normal"
             ttk.Button(
                 row,
                 text=action_text,
                 style=action_style,
                 command=action,
+                state=action_state,
             ).grid(row=0, column=1, rowspan=2, sticky="e")
 
     def show_new_lecture(self) -> None:
@@ -564,7 +604,29 @@ class StudyApp(tk.Tk):
             daemon=True,
         ).start()
 
-    def show_processing_screen(self, recording: BBBRecording) -> None:
+    def start_context_packaging(self, recording: BBBRecording) -> None:
+        self._processing_status.set("Собираем локальный пакет для выбранного чата…")
+        self.show_processing_screen(
+            recording,
+            heading="Собираем пакет контекста",
+            description=(
+                "Объединим транскрипцию, текст слайдов и OCR экрана. "
+                "Нейросеть и платные API на этом шаге не используются."
+            ),
+        )
+        threading.Thread(
+            target=self._context_packaging_worker,
+            args=(recording,),
+            daemon=True,
+        ).start()
+
+    def show_processing_screen(
+        self,
+        recording: BBBRecording,
+        *,
+        heading: str = "Подготавливаем материалы",
+        description: str = "Аудио и кадры будут обработаны на этом компьютере. Платные API не используются.",
+    ) -> None:
         screen = ttk.Frame(self.content, style="TFrame")
         screen.configure(padding=(40, 40, 40, 40))
         screen.grid_columnconfigure(0, weight=1)
@@ -572,7 +634,7 @@ class StudyApp(tk.Tk):
 
         tk.Label(
             screen,
-            text="Подготавливаем материалы",
+            text=heading,
             font=self.type.title,
             foreground=PALETTE["ink"],
             background=PALETTE["canvas"],
@@ -597,7 +659,7 @@ class StudyApp(tk.Tk):
         ).grid(row=0, column=0, sticky="w")
         tk.Label(
             panel,
-            text="Аудио и кадры будут обработаны на этом компьютере. Платные API не используются.",
+            text=description,
             font=self.type.body,
             foreground=PALETTE["muted"],
             background=PALETTE["surface_soft"],
@@ -646,6 +708,27 @@ class StudyApp(tk.Tk):
         else:
             self.after(0, lambda: self._finish_processing_success(prepared))
 
+    def _context_packaging_worker(self, recording: BBBRecording) -> None:
+        try:
+            package = build_context_package(
+                recording,
+                progress=lambda message: self.after(
+                    0,
+                    lambda: self._processing_status.set(message),
+                ),
+            )
+        except ContextPackageError as exc:
+            self.after(0, lambda: self._finish_processing_error(str(exc)))
+        except Exception:
+            self.after(
+                0,
+                lambda: self._finish_processing_error(
+                    "Не удалось собрать пакет контекста из локальных материалов."
+                ),
+            )
+        else:
+            self.after(0, lambda: self._finish_context_package_success(package))
+
     def _finish_processing_success(self, prepared) -> None:
         if self._processing_progress is not None and self._processing_progress.winfo_exists():
             self._processing_progress.stop()
@@ -654,6 +737,390 @@ class StudyApp(tk.Tk):
             f"Готово: транскрипция, {prepared.frame_count} кадров {ocr} сохранены локально."
         )
         self._enable_processing_return()
+
+    def _finish_context_package_success(self, package: ContextPackage) -> None:
+        if self._processing_progress is not None and self._processing_progress.winfo_exists():
+            self._processing_progress.stop()
+        self._processing_status.set(
+            "Готово: создано 3 файла для чата — контекст Markdown, структурированные "
+            f"данные и инструкция. Временных блоков: {package.timeline_block_count}."
+        )
+        self._enable_processing_return()
+
+    def show_chat_provider_choice(self, recording: BBBRecording) -> None:
+        screen = ttk.Frame(self.content, style="TFrame")
+        screen.configure(padding=(40, 32, 40, 40))
+        screen.grid_columnconfigure(0, weight=1)
+
+        ttk.Button(
+            screen,
+            text="← К библиотеке",
+            style="Secondary.TButton",
+            command=self.show_library,
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            screen,
+            text="Выбери чат для конспекта",
+            font=self.type.title,
+            foreground=PALETTE["ink"],
+            background=PALETTE["canvas"],
+        ).grid(row=1, column=0, sticky="w", pady=(34, 0))
+        tk.Label(
+            screen,
+            text=(
+                "Контекст лекции и инструкция уже подготовлены локально. "
+                "Выбери веб-чат, в котором хочешь получить lesson.md."
+            ),
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["canvas"],
+            wraplength=760,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 24))
+
+        panel = tk.Frame(
+            screen,
+            background=PALETTE["surface_soft"],
+            highlightbackground=PALETTE["line"],
+            highlightthickness=1,
+            padx=28,
+            pady=26,
+        )
+        panel.grid(row=3, column=0, sticky="ew")
+        panel.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            panel,
+            text="ChatGPT",
+            font=self.type.heading,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            panel,
+            text="Использует твой обычный вход в ChatGPT; API и ключи не нужны.",
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Button(
+            panel,
+            text="Выбрать ChatGPT",
+            style="Primary.TButton",
+            command=lambda: self.show_chatgpt_handoff(recording),
+        ).grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Separator(panel, orient="horizontal").grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=22,
+        )
+        tk.Label(
+            panel,
+            text="DeepSeek",
+            font=self.type.heading,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=3, column=0, sticky="w")
+        tk.Label(
+            panel,
+            text="Откроется веб-чат DeepSeek. Отправка выполняется только после твоей проверки.",
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=4, column=0, sticky="w", pady=(5, 0))
+        ttk.Button(
+            panel,
+            text="Выбрать DeepSeek",
+            style="Primary.TButton",
+            command=lambda: self.show_deepseek_handoff(recording),
+        ).grid(row=3, column=1, rowspan=2, sticky="e")
+
+        self._show_screen(screen, animated=True)
+
+    def show_chatgpt_handoff(self, recording: BBBRecording) -> None:
+        self._show_web_chat_handoff(recording, provider="ChatGPT")
+
+    def show_deepseek_handoff(self, recording: BBBRecording) -> None:
+        self._show_web_chat_handoff(recording, provider="DeepSeek")
+
+    def _show_web_chat_handoff(self, recording: BBBRecording, *, provider: str) -> None:
+        try:
+            if provider == "ChatGPT":
+                handoff = prepare_chatgpt_handoff(recording)
+                description = "Используется твой обычный вход в ChatGPT — API и ключи не нужны."
+            else:
+                handoff = prepare_deepseek_handoff(recording)
+                description = (
+                    "Используется веб-чат DeepSeek без API. Условия доступа зависят "
+                    "от твоего аккаунта DeepSeek."
+                )
+        except (ChatGPTHandoffError, DeepSeekHandoffError):
+            self.show_library()
+            return
+
+        self._active_handoff = handoff
+        self._active_handoff_provider = provider
+        self._handoff_status.set(
+            f"Когда нажмёшь кнопку ниже, приложение откроет {provider} и папку с файлом. "
+            "Инструкция для создания lesson.md будет скопирована в буфер обмена."
+        )
+
+        screen = ttk.Frame(self.content, style="TFrame")
+        screen.configure(padding=(40, 32, 40, 40))
+        screen.grid_columnconfigure(0, weight=1)
+        screen.grid_rowconfigure(2, weight=1)
+
+        ttk.Button(
+            screen,
+            text="← Выбрать другой чат",
+            style="Secondary.TButton",
+            command=lambda: self.show_chat_provider_choice(recording),
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            screen,
+            text=f"Создаём конспект в {provider}",
+            font=self.type.title,
+            foreground=PALETTE["ink"],
+            background=PALETTE["canvas"],
+        ).grid(row=1, column=0, sticky="w", pady=(34, 0))
+
+        panel = tk.Frame(
+            screen,
+            background=PALETTE["surface_soft"],
+            highlightbackground=PALETTE["line"],
+            highlightthickness=1,
+            padx=28,
+            pady=28,
+        )
+        panel.grid(row=2, column=0, sticky="nsew", pady=(24, 0))
+        panel.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            panel,
+            text=recording.title,
+            font=self.type.heading,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            panel,
+            text=description,
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+            wraplength=720,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(8, 22))
+
+        steps = (
+            "1. Выбери новый или нужный существующий чат.\n"
+            "2. Прикрепи lesson-context.md из открывшейся папки.\n"
+            "3. Вставь инструкцию из буфера сочетанием Ctrl+V и сам отправь сообщение."
+        )
+        tk.Label(
+            panel,
+            text=steps,
+            font=self.type.body,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+            justify="left",
+        ).grid(row=2, column=0, sticky="w")
+        ttk.Button(
+            panel,
+            text=f"Открыть {provider} и скопировать инструкцию",
+            style="Primary.TButton",
+            command=self._launch_active_handoff,
+        ).grid(row=3, column=0, sticky="w", pady=(26, 0))
+        ttk.Button(
+            panel,
+            text="Я получил ответ — вставить и сохранить",
+            style="Secondary.TButton",
+            command=lambda: self.show_lesson_editor(recording),
+        ).grid(row=4, column=0, sticky="w", pady=(12, 0))
+        tk.Label(
+            panel,
+            textvariable=self._handoff_status,
+            font=self.type.small,
+            foreground=PALETTE["muted"],
+            background=PALETTE["surface_soft"],
+            justify="left",
+            wraplength=720,
+        ).grid(row=5, column=0, sticky="w", pady=(18, 0))
+
+        self._show_screen(screen, animated=True)
+
+    def _launch_active_handoff(self) -> None:
+        handoff = self._active_handoff
+        provider = self._active_handoff_provider
+        if handoff is None or provider is None:
+            self._handoff_status.set("Сначала выбери лекцию с готовым пакетом контекста.")
+            return
+
+        try:
+            prompt = handoff.prompt_path.read_text(encoding="utf-8").strip()
+            self.clipboard_clear()
+            self.clipboard_append(prompt)
+            self.update()
+            if provider == "ChatGPT":
+                launch_chatgpt_handoff(handoff)
+            else:
+                launch_deepseek_handoff(handoff)
+        except (ChatGPTHandoffError, DeepSeekHandoffError, OSError) as exc:
+            self._handoff_status.set(str(exc))
+        except tk.TclError:
+            self._handoff_status.set("Не удалось скопировать инструкцию в буфер обмена.")
+        else:
+            self._handoff_status.set(
+                f"{provider} и папка с файлом открыты. Выбери нужный чат, прикрепи "
+                "lesson-context.md, вставь Ctrl+V и отправь сообщение."
+            )
+
+    def show_lesson_editor(self, recording: BBBRecording) -> None:
+        self._lesson_status.set("")
+        screen = ttk.Frame(self.content, style="TFrame")
+        screen.configure(padding=(40, 32, 40, 40))
+        screen.grid_columnconfigure(0, weight=1)
+        screen.grid_rowconfigure(3, weight=1)
+
+        ttk.Button(
+            screen,
+            text="← К выбору чата",
+            style="Secondary.TButton",
+            command=lambda: self.show_chat_provider_choice(recording),
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            screen,
+            text="Сохрани готовый конспект",
+            font=self.type.title,
+            foreground=PALETTE["ink"],
+            background=PALETTE["canvas"],
+        ).grid(row=1, column=0, sticky="w", pady=(34, 0))
+        tk.Label(
+            screen,
+            text=(
+                "Вставь полный ответ из ChatGPT или DeepSeek. Он сохранится локально "
+                "как lesson.md и останется привязан к этой лекции."
+            ),
+            font=self.type.body,
+            foreground=PALETTE["muted"],
+            background=PALETTE["canvas"],
+            wraplength=780,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(8, 18))
+
+        editor = scrolledtext.ScrolledText(
+            screen,
+            font=self.type.body,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+            insertbackground=PALETTE["ink"],
+            relief="solid",
+            borderwidth=1,
+            wrap="word",
+            padx=18,
+            pady=16,
+            undo=True,
+        )
+        editor.grid(row=3, column=0, sticky="nsew")
+        try:
+            existing = read_generated_lesson(recording)
+        except LessonOutputError:
+            existing = ""
+        if existing:
+            editor.insert("1.0", existing)
+        self._lesson_editor = editor
+
+        actions = tk.Frame(screen, background=PALETTE["canvas"])
+        actions.grid(row=4, column=0, sticky="ew", pady=(18, 0))
+        ttk.Button(
+            actions,
+            text="Сохранить lesson.md",
+            style="Primary.TButton",
+            command=lambda: self._save_lesson_from_editor(recording),
+        ).pack(side="left")
+        tk.Label(
+            actions,
+            textvariable=self._lesson_status,
+            font=self.type.small,
+            foreground=PALETTE["danger"],
+            background=PALETTE["canvas"],
+            wraplength=520,
+            justify="left",
+        ).pack(side="left", padx=(16, 0))
+
+        self._show_screen(screen, animated=True)
+
+    def _save_lesson_from_editor(self, recording: BBBRecording) -> None:
+        editor = self._lesson_editor
+        if editor is None or not editor.winfo_exists():
+            self._lesson_status.set("Поле для конспекта недоступно. Открой его снова.")
+            return
+
+        try:
+            saved = save_generated_lesson(recording, editor.get("1.0", "end-1c"))
+        except LessonOutputError as exc:
+            self._lesson_status.set(str(exc))
+            return
+
+        self._lesson_status.set(
+            f"Сохранено локально: lesson.md ({saved.character_count} символов)."
+        )
+        self.after(180, lambda: self.show_lesson_reader(recording))
+
+    def show_lesson_reader(self, recording: BBBRecording) -> None:
+        try:
+            content = read_generated_lesson(recording)
+        except LessonOutputError:
+            self.show_lesson_editor(recording)
+            return
+
+        screen = ttk.Frame(self.content, style="TFrame")
+        screen.configure(padding=(40, 32, 40, 40))
+        screen.grid_columnconfigure(0, weight=1)
+        screen.grid_rowconfigure(3, weight=1)
+        ttk.Button(
+            screen,
+            text="← К библиотеке",
+            style="Secondary.TButton",
+            command=self.show_library,
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            screen,
+            text="Готовый конспект",
+            font=self.type.title,
+            foreground=PALETTE["ink"],
+            background=PALETTE["canvas"],
+        ).grid(row=1, column=0, sticky="w", pady=(34, 0))
+        tk.Label(
+            screen,
+            text=recording.title,
+            font=self.type.body_bold,
+            foreground=PALETTE["muted"],
+            background=PALETTE["canvas"],
+        ).grid(row=2, column=0, sticky="w", pady=(8, 18))
+
+        reader = scrolledtext.ScrolledText(
+            screen,
+            font=self.type.body,
+            foreground=PALETTE["ink"],
+            background=PALETTE["surface_soft"],
+            relief="solid",
+            borderwidth=1,
+            wrap="word",
+            padx=18,
+            pady=16,
+        )
+        reader.grid(row=3, column=0, sticky="nsew")
+        reader.insert("1.0", content)
+        reader.configure(state="disabled")
+        ttk.Button(
+            screen,
+            text="Изменить конспект",
+            style="Secondary.TButton",
+            command=lambda: self.show_lesson_editor(recording),
+        ).grid(row=4, column=0, sticky="w", pady=(18, 0))
+
+        self._show_screen(screen, animated=True)
 
     def _finish_processing_error(self, message: str) -> None:
         if self._processing_progress is not None and self._processing_progress.winfo_exists():
